@@ -24,7 +24,7 @@ El motivo debe ser una frase breve en español. Si faltan datos o no se solicita
 /** Extracts a call request through GPT-5.6 function calling. */
 export async function processMessage(text: string): Promise<AgentResult> {
   const response = await getOpenAI().chat.completions.create({
-    model: process.env.OPENAI_MODEL || 'gpt-5.6',
+    model: gpt-4o,
     messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: text }],
     tools: [
       {
@@ -85,7 +85,7 @@ export async function getAgentResponse(
   history: VoiceTurn[] = [],
 ): Promise<{ text: string; hangUp: boolean }> {
   const response = await getOpenAI().chat.completions.create({
-    model: process.env.OPENAI_MODEL || 'gpt-5.6',
+    model: gpt-4o,
     messages: [
       { role: 'system', content: `Eres Sofia, asistente comercial de Dopa (dopa.solutions).
 
