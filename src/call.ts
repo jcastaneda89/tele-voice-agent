@@ -6,10 +6,10 @@ interface CallParams {
 }
 
 /**
- * Initiates an outbound PSTN call via Twilio ConversationRelay.
+ * Initiates an outbound PSTN call via Twilio Voice + Gather.
  * The call recipient will talk to an AI voice agent that responds in Spanish.
  *
- * Callback URL uses /twiml which returns ConversationRelay TwiML.
+ * Callback URL uses /twiml which returns the Spanish Gather loop TwiML.
  */
 export async function initiateCall(params: CallParams): Promise<string> {
   const { phoneNumber, prompt } = params;
@@ -32,7 +32,7 @@ export async function initiateCall(params: CallParams): Promise<string> {
     url: `${baseUrl}/twiml?prompt=${encodeURIComponent(prompt)}`,
     statusCallback: `${baseUrl}/status`,
     statusCallbackMethod: 'POST',
-    statusCallbackEvent: ['completed'],
+    statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
     record: false,
   });
 

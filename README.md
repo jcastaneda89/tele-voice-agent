@@ -19,11 +19,9 @@ Every file in this repo was generated or significantly accelerated by Codex with
 
 | `/feedback` ID | What was built |
 |----------------|---------------|
-| *(session-1)* | Telegram bot webhook handler — receives messages, sends replies |
-| *(session-2)* | GPT-5.6 agent with tool calling — extracts phone numbers, understands intent |
-| *(session-3)* | Twilio voice call integration — ConversationRelay + ElevenLabs TTS |
-| *(session-4)* | Express server wiring — routes, env config, ngrok setup |
-| *(session-5)* | README, documentation, and demo script |
+| `019f72b3-68e6-7c80-b9df-036b6df84938` | Telegram bot webhook handler + GPT-5.6 agent with function calling — message parsing, phone extraction, and call initiation |
+| `019f72c8-0601-7612-a4e5-adebe90680eb` | Twilio voice integration — TwiML endpoints with `<Gather input="speech">` for Spanish conversations, Polly TTS, and callback loop |
+| `019f72d1-60ed-7761-9ae6-2f4d53dda200` | Express server wiring — routes, webhook registration, error handling, async message processing, and ngrok setup |
 
 ### Key Decisions Made with Codex
 

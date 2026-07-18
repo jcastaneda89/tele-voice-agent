@@ -1,60 +1,42 @@
 import OpenAI from 'openai';
 
-let _openai: OpenAI | null = null;
+let openai: OpenAI | undefined;
 function getOpenAI(): OpenAI {
-  if (!_openai) {
-    _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  }
-  return _openai;
+  if (!openai) openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return openai;
 }
 
-interface AgentResult {
-  action: 'call' | 'reply';
-  phoneNumber?: string;
-  reason?: string;
-  message?: string;
-}
+export type AgentResult =
+  | { action: 'call'; phoneNumber: string; reason: string }
+  | { action: 'reply'; message: string };
 
-const SYSTEM_PROMPT = `Eres un asistente virtual que ayuda a iniciar llamadas telefónicas con IA.
-Tu única función es extraer números de teléfono y motivos de llamada de los mensajes del usuario.
 
-REGLAS:
-1. Si el mensaje contiene un numero de telefono y un motivo, usa la funcion initiate_call.
-2. El numero debe estar en formato E.164 (con codigo de pais, ej: +51979300062).
-3. Si el numero no tiene codigo de pais, asume Peru (+51).
-4. Si el usuario solo saluda o pregunta algo sin dar un numero, usa la funcion reply con un mensaje amable.
-5. El motivo (reason) debe ser una frase corta en espanol que describa el proposito de la llamada.`;
+export type VoiceTurn = {
+  role: 'user' | 'assistant';
+  content: string;
+};
+const SYSTEM_PROMPT = `Eres un asistente que prepara llamadas telefónicas solicitadas por Telegram.
+Responde SIEMPRE usando exactamente una herramienta.
+Usa initiate_call solo cuando el usuario solicita una llamada y proporciona un teléfono.
+Normaliza el teléfono a E.164. Si no incluye código de país, asume Perú (+51).
+El motivo debe ser una frase breve en español. Si faltan datos o no se solicita una llamada, usa reply y explica qué falta.`;
 
-/**
- * Processes a user message with GPT-5.6 to determine if a call should be made.
- * Uses tool calling (function calling) for structured extraction.
- */
+/** Extracts a call request through GPT-5.6 function calling. */
 export async function processMessage(text: string): Promise<AgentResult> {
-  console.log('[AGENT] Processing:', text);
-
   const response = await getOpenAI().chat.completions.create({
-    model: 'gpt-4o', // GPT-5.6 when available; gpt-4o as fallback
-    messages: [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: text },
-    ],
+    model: process.env.OPENAI_MODEL || 'gpt-5.6',
+    messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: text }],
     tools: [
       {
         type: 'function',
         function: {
           name: 'initiate_call',
-          description: 'Inicia una llamada telefónica con IA al número especificado',
+          description: 'Extract a phone number and a reason to start an outbound voice call.',
           parameters: {
-            type: 'object',
+            type: 'object', additionalProperties: false,
             properties: {
-              phoneNumber: {
-                type: 'string',
-                description: 'Número de teléfono en formato E.164 (ej: +51979300062)',
-              },
-              reason: {
-                type: 'string',
-                description: 'Motivo de la llamada en español',
-              },
+              phoneNumber: { type: 'string', description: 'E.164 number, e.g. +51979300062.' },
+              reason: { type: 'string', description: 'Short Spanish call purpose.' },
             },
             required: ['phoneNumber', 'reason'],
           },
@@ -63,119 +45,59 @@ export async function processMessage(text: string): Promise<AgentResult> {
       {
         type: 'function',
         function: {
-          name: 'reply',
-          description: 'Responde al usuario sin iniciar una llamada',
+          name: 'reply', description: 'Reply when a call cannot or should not be initiated.',
           parameters: {
-            type: 'object',
-            properties: {
-              message: {
-                type: 'string',
-                description: 'Mensaje de respuesta en español',
-              },
-            },
-            required: ['message'],
+            type: 'object', additionalProperties: false,
+            properties: { message: { type: 'string' } }, required: ['message'],
           },
         },
       },
     ],
-    tool_choice: 'auto',
-    temperature: 0.1,
+    tool_choice: 'required',
   });
 
-  const message = response.choices[0]?.message;
+  const toolCall = response.choices[0]?.message.tool_calls?.[0];
+  if (!toolCall || toolCall.type !== 'function') throw new Error('GPT did not return a tool call.');
 
-  if (message?.tool_calls?.length) {
-    const toolCall = message.tool_calls[0];
-    const args = JSON.parse(toolCall.function.arguments);
+  let args: unknown;
+  try { args = JSON.parse(toolCall.function.arguments); }
+  catch { throw new Error('GPT returned invalid tool arguments.'); }
 
-    if (toolCall.function.name === 'initiate_call') {
-      return {
-        action: 'call',
-        phoneNumber: args.phoneNumber,
-        reason: args.reason,
-      };
-    }
-    if (toolCall.function.name === 'reply') {
-      return { action: 'reply', message: args.message };
-    }
+  if (toolCall.function.name === 'initiate_call' && isCallArgs(args)) {
+    return { action: 'call', phoneNumber: args.phoneNumber, reason: args.reason };
   }
-
-  // Fallback: try parsing the content as JSON (handles markdown code fences)
-  let content = message?.content || '';
-  // Strip markdown code fences if present
-  content = content.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-  if (content.startsWith('{')) {
-    try {
-      const parsed = JSON.parse(content);
-      if (parsed.action === 'call' && parsed.phoneNumber) {
-        return parsed;
-      }
-      if (parsed.action === 'reply') {
-        return parsed;
-      }
-    } catch {
-      // Not valid JSON, fall through
-    }
-  }
-
-  return { action: 'reply', message: content || 'No entendí. Intenta de nuevo con un número de teléfono.' };
+  if (toolCall.function.name === 'reply' && isReplyArgs(args)) return { action: 'reply', message: args.message };
+  throw new Error('GPT returned an unsupported tool payload.');
 }
 
-/**
- * Conversational agent for voice calls.
- * Receives the call context (prompt) and what the caller just said (speechInput),
- * returns the AI agent's spoken response and whether to hang up.
- *
- * Built with Codex + GPT-5.6 — the agent maintains conversational context
- * through the system prompt and decides when the conversation is complete.
- */
+function isCallArgs(value: unknown): value is { phoneNumber: string; reason: string } {
+  return typeof value === 'object' && value !== null &&
+    typeof (value as Record<string, unknown>).phoneNumber === 'string' &&
+    typeof (value as Record<string, unknown>).reason === 'string';
+}
+function isReplyArgs(value: unknown): value is { message: string } {
+  return typeof value === 'object' && value !== null && typeof (value as Record<string, unknown>).message === 'string';
+}
+
 export async function getAgentResponse(
   context: string,
-  speechInput: string
+  speechInput: string,
+  history: VoiceTurn[] = [],
 ): Promise<{ text: string; hangUp: boolean }> {
   const response = await getOpenAI().chat.completions.create({
-    model: 'gpt-4o',
+    model: process.env.OPENAI_MODEL || 'gpt-5.6',
     messages: [
-      {
-        role: 'system',
-        content: `Eres Sofía, asistente comercial de Dopa. Tu trabajo es conversar por teléfono con un cliente potencial.
+      { role: 'system', content: `Eres Sofia, asistente comercial de Dopa (dopa.solutions).
 
-CONTEXTO DE LA LLAMADA: ${context}
+DOPA: ERP Agentico con trabajadores de IA autonomos 24/7. Atiende WhatsApp/IG/voz, gestiona inventario, factura electronica (SUNAT/SAT/DIAN), publica contenido, y concilia bancos via Plaid (13,000+ bancos). Planes: Starter gratis, Pro $997 USD unico, Dopa 360 enterprise. Web: dopa.solutions.
 
-INFORMACIÓN DE DOPA QUE DEBES CONOCER:
-- Dopa es un ERP Agéntico: trabajadores digitales con IA que operan el negocio 24/7.
-- Atiende clientes por WhatsApp, Instagram, Messenger y llamadas de voz.
-- Crea y publica contenido en redes sociales automáticamente.
-- Gestiona inventario, emite facturas electrónicas (SUNAT, SAT, DIAN) y concilia cuentas bancarias.
-- Se conecta a más de 13,000 bancos vía Plaid para finanzas en tiempo real.
-- Planes: Starter (gratis, 1 agente), Pro (setup único de $997 USD, hasta 5 agentes IA, Voice AI, facturación, e-commerce), y Dopa 360 (enterprise completo).
-- WEB: dopa.solutions — ahí pueden ver demo y empezar prueba gratis de 14 días.
-- Diferenciador: no es un chatbot. Los agentes ejecutan — cierran ventas, emiten facturas, publican contenido. Todo autónomo.
+CONTEXTO: ${context}
 
-REGLAS DE CONVERSACIÓN:
-1. Responde en español neutro LATAM, con voz cálida y profesional.
-2. Sé breve — máximo 2-3 oraciones por respuesta. Es una conversación telefónica.
-3. Si el cliente pregunta qué es Dopa, usa la info de arriba. NO inventes features.
-4. Si el cliente muestra interés, ofrece agendar una demo en dopa.solutions o enviar info por WhatsApp.
-5. Menciona los precios SOLO si el cliente pregunta explícitamente.
-6. Si el cliente hace 2+ preguntas y responde positivamente, ofrece agendar una cita.
-7. Si el cliente dice "adiós", "gracias", "nos vemos" o similar, despídete amablemente.
-8. Si el cliente pregunta algo que no está en la info de arriba, sé honesta: "Déjame consultarlo con el equipo y te envío la información por WhatsApp."
-9. Termina tu mensaje con [HANGUP] solo cuando la conversación haya concluido naturalmente.
-10. NO uses [HANGUP] si el cliente aún está interesado o haciendo preguntas.`,
-      },
-      {
-        role: 'user',
-        content: `El cliente dijo: "${speechInput}"\n\nResponde como Sofía. Si la conversación terminó, incluye [HANGUP] al final de tu mensaje.`,
-      },
+Responde en espanol neutro LATAM, maximo 2-3 oraciones. Si el cliente pregunta sobre Dopa, usa la info de arriba. Ofrece demo en dopa.solutions si hay interes. Anade [HANGUP] solo al despedirte. NO uses [HANGUP] si el cliente sigue interesado.` },
+      ...history.slice(-12),
+      { role: 'user', content: speechInput },
     ],
-    temperature: 0.7,
-    max_tokens: 150,
   });
-
-  const content = response.choices[0]?.message?.content || 'Gracias por tu tiempo. Te envío la información por WhatsApp.';
-  const hangUp = content.includes('[HANGUP]');
-  const text = content.replace('[HANGUP]', '').trim();
-
-  return { text, hangUp };
+  const raw = response.choices[0]?.message.content ?? 'Gracias por tu tiempo. Hasta luego.';
+  return { text: raw.replace('[HANGUP]', '').trim(), hangUp: raw.includes('[HANGUP]') };
 }

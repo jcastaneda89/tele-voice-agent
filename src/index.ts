@@ -1,118 +1,139 @@
+import twilio from 'twilio';
 import express from 'express';
 import dotenv from 'dotenv';
-import { handleTelegramMessage } from './bot.js';
-import { getAgentResponse } from './agent.js';
+import { getAgentResponse, type VoiceTurn } from './agent.js';
+import { getTelegramBot, processTelegramUpdate } from './bot.js';
 
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3456;
-
+const port = Number(process.env.PORT || 3456);
+const callHistories = new Map<string, VoiceTurn[]>();
+const missedSpeechCounts = new Map<string, number>();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-app.get('/', (_req, res) => {
-  res.send('TeleVoice Agent — Running. Built with Codex + GPT-5.6 during OpenAI Build Week 2026.');
-});
+app.get('/', (_req, res) => res.send('TeleVoice Agent is running.'));
 
-app.post('/webhook', async (req, res) => {
+/** Telegram webhook endpoint for node-telegram-bot-api's processUpdate pattern. */
+app.post('/webhook', (req, res) => {
+  const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  const suppliedSecret = req.header('x-telegram-bot-api-secret-token');
+  if (expectedSecret && suppliedSecret !== expectedSecret) {
+    res.sendStatus(401);
+    return;
+  }
+
   try {
-    const update = req.body;
-
-    if (update.message?.text) {
-      const chatId = update.message.chat.id;
-      const text = update.message.text;
-
-      // Process (Telegram expects a quick 200, so we'll handle it below)
-      try {
-        await handleTelegramMessage(chatId, text);
-      } catch (handlerErr) {
-        console.error('[WEBHOOK] Handler error:', handlerErr);
-      }
-      res.status(200).send('ok');
-    } else {
-      res.status(200).send('ok');
-    }
-  } catch (err) {
-    console.error('[WEBHOOK] Error:', err);
-    res.status(200).send('ok'); // Always 200 to Telegram
+    processTelegramUpdate(req.body);
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('[TELEGRAM] Invalid webhook update:', error);
+    res.sendStatus(200); // Telegram retries non-2xx responses.
   }
 });
 
-/**
- * Initial TwiML — starts the call with a greeting and prompts for speech input.
- */
 app.post('/twiml', (req, res) => {
-  const prompt = (req.query.prompt as string) || 'Contacto comercial.';
-  const firstMessage = `¡Hola! Soy Sofía, asistente virtual de Dopa. Me comunico porque ${prompt}. ¿Me escuchas bien?`;
-
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Lucia" language="es-MX">${escapeXml(firstMessage)}</Say>
-  <Gather input="speech" language="es-MX" speechTimeout="2" action="/gather" method="POST">
-    <Say voice="Polly.Lucia" language="es-MX">¿En qué puedo ayudarte?</Say>
-  </Gather>
-</Response>`;
-
-  res.type('text/xml').send(twiml);
+  const prompt = getPrompt(req.query.prompt);
+  const greeting = `Hola, soy Sofía, asistente virtual de Dopa. Me comunico porque ${prompt}. ¿Me escuchas bien?`;
+  res.type('text/xml').send(gatherResponse(greeting, prompt));
 });
 
-/**
- * Gather callback — processes the caller's speech, sends to GPT-5.6, and returns TwiML
- * with the agent's response. Loops until the agent decides to hang up or the caller
- * doesn't respond.
- */
 app.post('/gather', async (req, res) => {
-  const speechResult = req.body.SpeechResult;
-  const promptParam = req.query.prompt as string || '';
-
+  const speechResult = req.body.SpeechResult as string | undefined;
+  const prompt = getPrompt(req.query.prompt);
+  const callSid = req.body.CallSid as string | undefined;
   if (!speechResult) {
-    // No speech detected — say goodbye and hang up
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Lucia" language="es-MX">No escuché tu respuesta. ¡Gracias por tu tiempo! Te enviaré la información por WhatsApp.</Say>
-</Response>`;
-    res.type('text/xml').send(twiml);
+    const misses = callSid ? (missedSpeechCounts.get(callSid) ?? 0) + 1 : 2;
+    if (callSid) missedSpeechCounts.set(callSid, misses);
+    if (misses < 2) {
+      res.type('text/xml').send(gatherResponse('No logré escucharte. Por favor, responde después del tono.', prompt));
+      return;
+    }
+    clearCallState(callSid);
+    res.type('text/xml').send(hangupResponse('No logré escucharte. Gracias por tu tiempo. Hasta luego.'));
     return;
   }
 
-  console.log(`[CALL] Caller said: "${speechResult}"`);
+  if (callSid) missedSpeechCounts.delete(callSid);
 
-  // Get GPT-5.6 response
-  const aiResponse = await getAgentResponse(promptParam, speechResult);
-
-  if (aiResponse.hangUp) {
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Lucia" language="es-MX">${escapeXml(aiResponse.text)}</Say>
-</Response>`;
-    res.type('text/xml').send(twiml);
-    return;
+  try {
+    const history = callSid ? (callHistories.get(callSid) ?? []) : [];
+    const aiResponse = await getAgentResponse(prompt, speechResult, history);
+    if (callSid && !aiResponse.hangUp) {
+      callHistories.set(callSid, [...history, { role: 'user' as const, content: speechResult }, { role: 'assistant' as const, content: aiResponse.text }].slice(-12));
+    }
+    if (aiResponse.hangUp) {
+      clearCallState(callSid);
+      res.type('text/xml').send(hangupResponse(aiResponse.text));
+      return;
+    }
+    res.type('text/xml').send(gatherResponse(aiResponse.text, prompt, '¿Algo más en lo que pueda ayudarte?'));
+  } catch (error) {
+    console.error('[CALL] Gather handler failed:', error);
+    clearCallState(callSid);
+    res.type('text/xml').send(hangupResponse('Lo siento, ocurrió un error. Gracias por tu tiempo.'));
   }
-
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Lucia" language="es-MX">${escapeXml(aiResponse.text)}</Say>
-  <Gather input="speech" language="es-MX" speechTimeout="3" action="/gather?prompt=${encodeURIComponent(promptParam)}" method="POST">
-    <Say voice="Polly.Lucia" language="es-MX">¿Algo más en lo que pueda ayudarte?</Say>
-  </Gather>
-</Response>`;
-
-  res.type('text/xml').send(twiml);
 });
 
-/** Twilio call status callback — logs call completion events. */
 app.post('/status', (req, res) => {
   const { CallSid, CallStatus, CallDuration } = req.body;
-  console.log(`[TWILIO] Call ${CallSid}: ${CallStatus} (${CallDuration}s)`);
-  res.status(200).send('ok');
+  console.log(`[TWILIO] Call ${CallSid}: ${CallStatus} (${CallDuration ?? 0}s)`);
+  if (['completed', 'busy', 'failed', 'no-answer', 'canceled'].includes(CallStatus) && CallSid) {
+    clearCallState(CallSid);
+  }
+  res.sendStatus(200);
 });
 
-function escapeXml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+function getPrompt(value: unknown): string {
+  return typeof value === 'string' && value.trim() ? value.trim() : 'Contacto comercial.';
 }
 
-app.listen(PORT, () => {
-  console.log(`[TELE-VOICE] Server running on port ${PORT}`);
-  console.log(`[TELE-VOICE] Set webhook: https://api.telegram.org/bot<TOKEN>/setWebhook?url=<YOUR_NGROK_URL>/webhook`);
+function gatherResponse(message: string, prompt: string, gatherPrompt = 'Cuéntame, ¿en qué puedo ayudarte?'): string {
+  const response = new twilio.twiml.VoiceResponse();
+  response.say({ voice: 'Polly.Lucia', language: 'es-MX' }, message);
+  const gather = response.gather({
+    input: ['speech'],
+    language: 'es-MX',
+    speechTimeout: '3',
+    actionOnEmptyResult: true,
+    action: `/gather?prompt=${encodeURIComponent(prompt)}`,
+    method: 'POST',
+  });
+  gather.say({ voice: 'Polly.Lucia', language: 'es-MX' }, gatherPrompt);
+  return response.toString();
+}
+
+function hangupResponse(message: string): string {
+  const response = new twilio.twiml.VoiceResponse();
+  response.say({ voice: 'Polly.Lucia', language: 'es-MX' }, message);
+  response.hangup();
+  return response.toString();
+}
+
+function clearCallState(callSid: string | undefined): void {
+  if (!callSid) return;
+  callHistories.delete(callSid);
+  missedSpeechCounts.delete(callSid);
+}
+
+app.listen(port, async () => {
+  console.log(`[TELE-VOICE] Server running on port ${port}`);
+  if (!process.env.TELEGRAM_BOT_TOKEN) {
+    console.warn('[TELEGRAM] TELEGRAM_BOT_TOKEN is not configured; webhook processing is disabled.');
+    return;
+  }
+  try {
+    const appUrl = process.env.APP_URL;
+    if (appUrl) {
+      await getTelegramBot().setWebHook(`${appUrl.replace(/\/$/, '')}/webhook`, {
+        secret_token: process.env.TELEGRAM_WEBHOOK_SECRET,
+      });
+      console.log('[TELEGRAM] Webhook registered.');
+    } else {
+      console.warn('[TELEGRAM] Set APP_URL to register the webhook automatically.');
+    }
+  } catch (error) {
+    console.error('[TELEGRAM] Webhook registration failed:', error);
+  }
 });
