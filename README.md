@@ -87,7 +87,9 @@ src/
 
 ## Demo Video
 
-[YouTube link — 3-minute demo showing the full flow]
+[![TeleVoice Agent Demo](https://img.youtube.com/vi/MMthZhSBDGc/maxresdefault.jpg)](https://youtu.be/MMthZhSBDGc)
+
+**Watch:** https://youtu.be/MMthZhSBDGc
 
 ## Built by
 
