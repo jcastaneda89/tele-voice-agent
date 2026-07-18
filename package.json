@@ -1,0 +1,26 @@
+{
+  "name": "tele-voice-agent",
+  "version": "1.0.0",
+  "description": "Telegram bot that initiates AI-powered voice calls — built during OpenAI Build Week 2026 with Codex + GPT-5.6",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": ["openai", "codex", "twilio", "telegram", "voice-ai", "gpt-5.6"],
+  "author": "José Castañeda",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "openai": "^4.52.0",
+    "twilio": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
